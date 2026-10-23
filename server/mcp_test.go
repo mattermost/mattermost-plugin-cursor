@@ -129,6 +129,16 @@ func happyPathCursorAPI(t *testing.T) http.Handler {
 				"id":"run-latest","status":"FINISHED","result":"Implemented the change",
 				"git":{"branches":[{"branch":"cursor/change","prUrl":"https://github.com/acme/repo/pull/1"}]}
 			}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/environments":
+			_, _ = io.WriteString(w, `{"items":[{
+				"id":"env-1","name":"Web app","owner":"team",
+				"repos":[
+					{"url":"https://github.com/acme/web"},
+					{"url":"https://github.com/acme/api"}
+				],
+				"createdAt":"2026-09-01T16:20:00.000Z",
+				"updatedAt":"2026-09-29T21:05:00.000Z"
+			}],"nextCursor":"MjA"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/agents":
 			_, _ = io.WriteString(w, `{"items":[{
 				"id":"bc-list","name":"Listed","status":"ACTIVE",
@@ -220,6 +230,27 @@ func TestMCPToolHandlersHappyPath(t *testing.T) {
 					},
 					CreatedAt: "2026-01-02T03:04:05Z",
 				}, output.Agents[0])
+			},
+		},
+		{
+			name: "list_environments",
+			run: func(t *testing.T) {
+				result, output, err := p.mcpListEnvironments(ctx, nil, listEnvironmentsInput{})
+				require.NoError(t, err)
+				assert.Nil(t, result)
+				assert.Equal(t, listEnvironmentsOutput{
+					Environments: []listedEnvironment{{
+						ID:    "env-1",
+						Name:  "Web app",
+						Owner: "team",
+						Repositories: []string{
+							"https://github.com/acme/web",
+							"https://github.com/acme/api",
+						},
+						UpdatedAt: "2026-09-29T21:05:00.000Z",
+					}},
+					NextCursor: "MjA",
+				}, output)
 			},
 		},
 		{
@@ -329,6 +360,35 @@ func TestMCPCreateAgentAcceptsSingleRepository(t *testing.T) {
 	assert.False(t, hasRepositories)
 }
 
+func TestMCPCreateAgentUsesNamedEnvironment(t *testing.T) {
+	var got cursorapi.CreateAgentRequest
+	p := newTestPlugin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(body, &got))
+		require.NotContains(t, string(body), `"repos"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{
+			"agent":{"id":"bc-created","name":"Created","status":"ACTIVE","url":"https://cursor.com/agents/bc-created"},
+			"run":{"id":"run-created","status":"CREATING"}
+		}`)
+	}))
+	recs := attachAuditCapture(p)
+	result, _, err := p.mcpCreateAgent(context.Background(), nil, createAgentInput{
+		Prompt:      "update both services",
+		Environment: " Web app ",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+	assert.Equal(t, cursorapi.CreateAgentRequest{
+		Prompt: cursorapi.Prompt{Text: "update both services"},
+		Env:    &cursorapi.AgentEnv{Type: "cloud", Name: "Web app"},
+	}, got)
+	rec := requireAudit(t, recs, auditEventMCPCreateAgent, "create_agent", model.AuditStatusSuccess)
+	assert.Equal(t, "Web app", rec.EventData.Parameters["environment"])
+}
+
 func TestMCPCreateAgentRejectsInvalidRepositories(t *testing.T) {
 	p := newTestPlugin(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("upstream should not be called for an invalid repository list")
@@ -393,6 +453,15 @@ func TestMCPCreateAgentRejectsInvalidRepositories(t *testing.T) {
 			},
 			want: "A repository URL is required when ref is set",
 		},
+		{
+			name: "environment with repositories",
+			input: createAgentInput{
+				Prompt:       "should not launch",
+				Environment:  "Web app",
+				Repositories: []repositoryInput{{URL: "https://github.com/acme/web"}},
+			},
+			want: "Omit repositories when environment is set",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -408,6 +477,71 @@ func TestMCPCreateAgentRejectsInvalidRepositories(t *testing.T) {
 			assert.Equal(t, test.want, text.Text)
 			rec := requireAudit(t, recs, auditEventMCPCreateAgent, "create_agent", model.AuditStatusFail)
 			assert.Equal(t, test.want, rec.Error.Description)
+		})
+	}
+}
+
+func TestMCPListEnvironmentsSendsFilters(t *testing.T) {
+	limit := 20
+	p := newTestPlugin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/environments", r.URL.Path)
+		assert.Equal(t, "web", r.URL.Query().Get("query"))
+		assert.Equal(t, "team", r.URL.Query().Get("owner"))
+		assert.Equal(t, "20", r.URL.Query().Get("limit"))
+		assert.Equal(t, "MjA", r.URL.Query().Get("cursor"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	}))
+	result, output, err := p.mcpListEnvironments(context.Background(), nil, listEnvironmentsInput{
+		Query:  " web ",
+		Owner:  " team ",
+		Limit:  &limit,
+		Cursor: " MjA ",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+	assert.Empty(t, output.Environments)
+	assert.NotNil(t, output.Environments)
+	assert.Empty(t, output.NextCursor)
+}
+
+func TestMCPListEnvironmentsRejectsInvalidFilters(t *testing.T) {
+	p := newTestPlugin(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("upstream should not be called for invalid environment filters")
+	}))
+	limit := 101
+	tests := []struct {
+		name  string
+		input listEnvironmentsInput
+		want  string
+	}{
+		{
+			name:  "owner",
+			input: listEnvironmentsInput{Owner: "org"},
+			want:  "owner must be personal or team",
+		},
+		{
+			name:  "limit",
+			input: listEnvironmentsInput{Limit: &limit},
+			want:  "limit must be between 1 and 100",
+		},
+		{
+			name:  "query",
+			input: listEnvironmentsInput{Query: strings.Repeat("a", 256)},
+			want:  "query must be at most 255 characters",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, output, err := p.mcpListEnvironments(context.Background(), nil, test.input)
+			require.NoError(t, err)
+			assert.Equal(t, listEnvironmentsOutput{}, output)
+			require.NotNil(t, result)
+			assert.True(t, result.IsError)
+			text, ok := result.Content[0].(*mcp.TextContent)
+			require.True(t, ok)
+			assert.Equal(t, test.want, text.Text)
 		})
 	}
 }
@@ -443,6 +577,13 @@ func TestMCPToolHandlersMissingKey(t *testing.T) {
 			name: "list_agents",
 			call: func() *mcp.CallToolResult {
 				result, _, _ := p.mcpListAgents(ctx, nil, listAgentsInput{})
+				return result
+			},
+		},
+		{
+			name: "list_environments",
+			call: func() *mcp.CallToolResult {
+				result, _, _ := p.mcpListEnvironments(ctx, nil, listEnvironmentsInput{})
 				return result
 			},
 		},
@@ -622,6 +763,25 @@ func TestMCPToolAuditLogs(t *testing.T) {
 		assert.Equal(t, 5, rec.EventData.Parameters["limit"])
 	})
 
+	t.Run("list_environments", func(t *testing.T) {
+		*recs = (*recs)[:0]
+		limit := 20
+		result, _, err := p.mcpListEnvironments(ctx, nil, listEnvironmentsInput{
+			Query:  " web ",
+			Owner:  "team",
+			Limit:  &limit,
+			Cursor: "MjA",
+		})
+		require.NoError(t, err)
+		assert.Nil(t, result)
+		rec := requireAudit(t, recs, auditEventMCPListEnvironments, "list_environments", model.AuditStatusSuccess)
+		assert.Equal(t, testMCPUserID, rec.Actor.UserId)
+		assert.Equal(t, "web", rec.EventData.Parameters["query"])
+		assert.Equal(t, "team", rec.EventData.Parameters["owner"])
+		assert.Equal(t, 20, rec.EventData.Parameters["limit"])
+		assert.Equal(t, "MjA", rec.EventData.Parameters["cursor"])
+	})
+
 	t.Run("add_followup", func(t *testing.T) {
 		*recs = (*recs)[:0]
 		result, _, err := p.mcpAddFollowup(ctx, nil, addFollowupInput{
@@ -693,6 +853,15 @@ func TestMCPToolAuditMissingUserID(t *testing.T) {
 			tool:  "list_agents",
 			call: func() *mcp.CallToolResult {
 				result, _, _ := p.mcpListAgents(ctx, nil, listAgentsInput{})
+				return result
+			},
+		},
+		{
+			name:  "list_environments",
+			event: auditEventMCPListEnvironments,
+			tool:  "list_environments",
+			call: func() *mcp.CallToolResult {
+				result, _, _ := p.mcpListEnvironments(ctx, nil, listEnvironmentsInput{})
 				return result
 			},
 		},

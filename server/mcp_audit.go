@@ -13,6 +13,7 @@ const (
 	auditEventMCPCreateAgent          = "mcpCreateAgent"
 	auditEventMCPGetAgent             = "mcpGetAgent"
 	auditEventMCPListAgents           = "mcpListAgents"
+	auditEventMCPListEnvironments     = "mcpListEnvironments"
 	auditEventMCPAddFollowup          = "mcpAddFollowup"
 	auditEventMCPGetAgentConversation = "mcpGetAgentConversation"
 	auditMCPObjectType                = "cursor_cloud_agent"
@@ -66,7 +67,7 @@ func (p *Plugin) finishMCPAudit(rec *model.AuditRecord) {
 		"user_id", userID,
 		"status", rec.Status,
 	}
-	for _, key := range []string{"agent_id", "repository", "ref", "repositories", "refs", "limit", "model"} {
+	for _, key := range []string{"agent_id", "repository", "ref", "repositories", "refs", "environment", "query", "owner", "cursor", "limit", "model"} {
 		value, ok := rec.EventData.Parameters[key]
 		if !ok {
 			continue

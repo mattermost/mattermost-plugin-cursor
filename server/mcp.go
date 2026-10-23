@@ -34,7 +34,8 @@ type createAgentInput struct {
 	Prompt       string            `json:"prompt" jsonschema:"Task for the autonomous Cursor Cloud agent,minLength=1"`
 	Repository   string            `json:"repository,omitempty" jsonschema:"Single repository URL such as https://github.com/org/repo. Omit when repositories is set."`
 	Ref          string            `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA for repository. Omit when repositories is set."`
-	Repositories []repositoryInput `json:"repositories,omitempty" jsonschema:"Repositories the Cloud agent clones. Pass one entry per repository so one agent can work across several. Each entry can set its own ref. Omit when repository is set. Cursor Cloud accepts at most 500."`
+	Repositories []repositoryInput `json:"repositories,omitempty" jsonschema:"Repositories the Cloud agent clones. Pass one entry per repository so one agent can work across several. Each entry can set its own ref. Omit when repository or environment is set. Cursor Cloud accepts at most 500."`
+	Environment  string            `json:"environment,omitempty" jsonschema:"Saved Cloud environment name. Cursor runs the agent in that environment, so omit repository and repositories."`
 	Model        string            `json:"model,omitempty" jsonschema:"Optional Cursor model ID"`
 	AutoCreatePR *bool             `json:"auto_create_pr,omitempty" jsonschema:"Whether Cursor should open a pull request when work completes"`
 }
@@ -77,6 +78,26 @@ type listAgentsOutput struct {
 	Agents []listedAgent `json:"agents"`
 }
 
+type listEnvironmentsInput struct {
+	Query  string `json:"query,omitempty" jsonschema:"Optional case-insensitive text matched against the environment name,maxLength=255"`
+	Owner  string `json:"owner,omitempty" jsonschema:"Optional owner filter,enum=personal,enum=team"`
+	Limit  *int   `json:"limit,omitempty" jsonschema:"Maximum environments to return,minimum=1,maximum=100"`
+	Cursor string `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous list_environments response"`
+}
+
+type listedEnvironment struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Owner        string   `json:"owner"`
+	Repositories []string `json:"repositories"`
+	UpdatedAt    string   `json:"updated_at"`
+}
+
+type listEnvironmentsOutput struct {
+	Environments []listedEnvironment `json:"environments"`
+	NextCursor   string              `json:"next_cursor,omitempty"`
+}
+
 type addFollowupInput struct {
 	AgentID string `json:"agent_id" jsonschema:"Cursor Cloud agent ID,minLength=1"`
 	Prompt  string `json:"prompt" jsonschema:"Follow-up instruction for the agent,minLength=1"`
@@ -116,7 +137,8 @@ func (p *Plugin) initMCPServer() {
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
 		Name: "create_agent",
 		Description: "Launch an autonomous Cursor Cloud agent and return immediately. " +
-			"Pass repositories to clone one or more repositories, or repository for a single repository. " +
+			"Pass repositories to clone one or more repositories, repository for a single repository, " +
+			"or environment to use a saved Cloud environment by name. " +
 			"The agent runs asynchronously; poll it with get_agent.",
 	}, p.mcpCreateAgent)
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
@@ -127,6 +149,11 @@ func (p *Plugin) initMCPServer() {
 		Name:        "list_agents",
 		Description: "List recent Cursor Cloud agents available to the configured service account.",
 	}, p.mcpListAgents)
+	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+		Name: "list_environments",
+		Description: "List saved Cursor Cloud environments the service account can use. " +
+			"Pass an environment name to create_agent.",
+	}, p.mcpListEnvironments)
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
 		Name: "add_followup",
 		Description: "Send a follow-up instruction to a Cursor Cloud agent. " +
@@ -161,6 +188,10 @@ func (p *Plugin) mcpCreateAgent(
 			model.AddEventParameterToAuditRec(rec, "refs", repositoryRefs)
 		}
 	}
+	environment := strings.TrimSpace(input.Environment)
+	if environment != "" {
+		model.AddEventParameterToAuditRec(rec, "environment", environment)
+	}
 	if input.Model != "" {
 		model.AddEventParameterToAuditRec(rec, "model", input.Model)
 	}
@@ -172,7 +203,7 @@ func (p *Plugin) mcpCreateAgent(
 	}
 	resolved, validationMessage := resolveRepositoryInputs(input)
 	var repos []cursorapi.RepoConfig
-	if validationMessage == "" {
+	if validationMessage == "" && (environment == "" || len(resolved) > 0) {
 		repos, validationMessage = normalizeRepositories(resolved)
 	}
 	if validationMessage != "" {
@@ -182,6 +213,7 @@ func (p *Plugin) mcpCreateAgent(
 	request := cursorapi.NewCreateAgentRequest(
 		input.Prompt,
 		repos,
+		environment,
 		input.Model,
 		input.AutoCreatePR,
 	)
@@ -302,6 +334,67 @@ func (p *Plugin) mcpListAgents(
 	return nil, output, nil
 }
 
+func (p *Plugin) mcpListEnvironments(
+	ctx context.Context,
+	_ *mcp.CallToolRequest,
+	input listEnvironmentsInput,
+) (*mcp.CallToolResult, listEnvironmentsOutput, error) {
+	rec, failure := p.beginMCPAudit(ctx, auditEventMCPListEnvironments, "list_environments")
+	defer p.finishMCPAudit(rec)
+	if failure != nil {
+		return failure, listEnvironmentsOutput{}, nil
+	}
+	if nameQuery := strings.TrimSpace(input.Query); nameQuery != "" {
+		model.AddEventParameterToAuditRec(rec, "query", nameQuery)
+	}
+	if owner := strings.TrimSpace(input.Owner); owner != "" {
+		model.AddEventParameterToAuditRec(rec, "owner", owner)
+	}
+	if input.Limit != nil {
+		model.AddEventParameterToAuditRec(rec, "limit", *input.Limit)
+	}
+	if cursor := strings.TrimSpace(input.Cursor); cursor != "" {
+		model.AddEventParameterToAuditRec(rec, "cursor", cursor)
+	}
+
+	client, _, failure := p.mcpClient()
+	if failure != nil {
+		rec.AddErrorDesc("service account API key is not configured")
+		return failure, listEnvironmentsOutput{}, nil
+	}
+	query, validationMessage := environmentListQuery(input)
+	if validationMessage != "" {
+		rec.AddErrorDesc(validationMessage)
+		return toolError(validationMessage), listEnvironmentsOutput{}, nil
+	}
+	response, err := client.ListEnvironments(ctx, query)
+	if err != nil {
+		rec.AddErrorDesc(err.Error())
+		return toolError(err.Error()), listEnvironmentsOutput{}, nil
+	}
+	list, err := cursorapi.Decode[cursorapi.ListEnvironmentsResponse](response)
+	if err != nil {
+		rec.AddErrorDesc(err.Error())
+		return cursorToolError(response, err), listEnvironmentsOutput{}, nil
+	}
+	output := listEnvironmentsOutput{
+		Environments: make([]listedEnvironment, 0, len(list.Items)),
+		NextCursor:   list.NextCursor,
+	}
+	for _, environment := range list.Items {
+		_, repositories := listedRepositories(environment.Repos)
+		output.Environments = append(output.Environments, listedEnvironment{
+			ID:           environment.ID,
+			Name:         environment.Name,
+			Owner:        environment.Owner,
+			Repositories: repositories,
+			UpdatedAt:    environment.UpdatedAt,
+		})
+	}
+	rec.Success()
+	return nil, output, nil
+}
+
 func (p *Plugin) mcpAddFollowup(
 	ctx context.Context,
 	_ *mcp.CallToolRequest,
@@ -389,6 +482,9 @@ func resolveRepositoryInputs(input createAgentInput) ([]repositoryInput, string)
 	repository := strings.TrimSpace(input.Repository)
 	ref := strings.TrimSpace(input.Ref)
 	hasSingular := repository != "" || ref != ""
+	if strings.TrimSpace(input.Environment) != "" && (len(input.Repositories) > 0 || hasSingular) {
+		return nil, "Omit repositories when environment is set"
+	}
 	if len(input.Repositories) > 0 && hasSingular {
 		return nil, "Pass repository or repositories, not both"
 	}
@@ -399,9 +495,38 @@ func resolveRepositoryInputs(input createAgentInput) ([]repositoryInput, string)
 		if ref != "" {
 			return nil, "A repository URL is required when ref is set"
 		}
+		if strings.TrimSpace(input.Environment) != "" {
+			return nil, ""
+		}
 		return nil, "At least one repository is required"
 	}
 	return []repositoryInput{{URL: repository, Ref: ref}}, ""
+}
+
+func environmentListQuery(input listEnvironmentsInput) (url.Values, string) {
+	query := make(url.Values)
+	if nameQuery := strings.TrimSpace(input.Query); nameQuery != "" {
+		if utf8.RuneCountInString(nameQuery) > 255 {
+			return nil, "query must be at most 255 characters"
+		}
+		query.Set("query", nameQuery)
+	}
+	if owner := strings.TrimSpace(input.Owner); owner != "" {
+		if owner != "personal" && owner != "team" {
+			return nil, "owner must be personal or team"
+		}
+		query.Set("owner", owner)
+	}
+	if input.Limit != nil {
+		if *input.Limit < 1 || *input.Limit > 100 {
+			return nil, "limit must be between 1 and 100"
+		}
+		query.Set("limit", strconv.Itoa(*input.Limit))
+	}
+	if cursor := strings.TrimSpace(input.Cursor); cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	return query, ""
 }
 
 func listedRepositories(repos []cursorapi.RepoConfig) (string, []string) {
