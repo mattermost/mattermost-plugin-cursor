@@ -94,39 +94,45 @@ type getAgentConversationOutput struct {
 }
 
 func (p *Plugin) initMCPServer() {
+	exposeExternal := p.getConfiguration().ExposeMCPToolsPublicly
+	p.setMCPServer(p.newMCPServer(exposeExternal), exposeExternal)
+}
+
+func (p *Plugin) newMCPServer(exposeExternal bool) *pluginmcp.Server {
 	version := "0.0.1"
 	if manifest != nil && manifest.Version != "" {
 		version = manifest.Version
 	}
-	p.mcpServer = pluginmcp.NewServer(p.API, pluginmcp.Config{
+	server := pluginmcp.NewServer(p.API, pluginmcp.Config{
 		PluginID:       pluginID,
 		Name:           "Cursor Cloud Agents",
 		Path:           mcpBasePath,
-		ExposeExternal: false,
+		ExposeExternal: exposeExternal,
 		Version:        version,
 	})
-	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+	pluginmcp.AddTool(server, &mcp.Tool{
 		Name: "create_agent",
 		Description: "Launch an autonomous Cursor Cloud agent on a repository and return immediately. " +
 			"The agent runs asynchronously; poll it with get_agent.",
 	}, p.mcpCreateAgent)
-	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+	pluginmcp.AddTool(server, &mcp.Tool{
 		Name:        "get_agent",
 		Description: "Get the current state and latest result of a Cursor Cloud agent.",
 	}, p.mcpGetAgent)
-	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+	pluginmcp.AddTool(server, &mcp.Tool{
 		Name:        "list_agents",
 		Description: "List recent Cursor Cloud agents available to the configured service account.",
 	}, p.mcpListAgents)
-	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+	pluginmcp.AddTool(server, &mcp.Tool{
 		Name: "add_followup",
 		Description: "Send a follow-up instruction to a Cursor Cloud agent. " +
 			"This fails with a conflict if the agent is still running.",
 	}, p.mcpAddFollowup)
-	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+	pluginmcp.AddTool(server, &mcp.Tool{
 		Name:        "get_agent_conversation",
 		Description: "Return recent messages from a Cursor Cloud agent conversation.",
 	}, p.mcpGetAgentConversation)
+	return server
 }
 
 func (p *Plugin) mcpCreateAgent(

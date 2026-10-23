@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/mattermost/mattermost-plugin-agents/v2/external/pluginmcp"
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
 	"github.com/mattermost/mattermost/server/public/pluginapi"
@@ -26,8 +25,8 @@ type Plugin struct {
 	plugin.MattermostPlugin
 	configurationState
 
-	client       *pluginapi.Client
-	mcpServer    *pluginmcp.Server
+	client *pluginapi.Client
+	mcpServerState
 	httpClient   *http.Client
 	hydration    hydrationCache
 	lookupUser   func(userID string) (*model.User, error)
@@ -46,14 +45,17 @@ func (p *Plugin) OnActivate() error {
 	}
 	p.hydration.initialize(hydrationCacheCapacity)
 	p.initMCPServer()
-	return p.mcpServer.Register()
+	return p.getMCPServer().Register()
 }
 
 func (p *Plugin) OnDeactivate() error {
-	if p.mcpServer == nil {
+	p.mcpApplyLock.Lock()
+	defer p.mcpApplyLock.Unlock()
+	server := p.getMCPServer()
+	if server == nil {
 		return nil
 	}
-	return p.mcpServer.Unregister()
+	return server.Unregister()
 }
 
 func (p *Plugin) ServeHTTP(_ *plugin.Context, w http.ResponseWriter, r *http.Request) {
@@ -64,11 +66,12 @@ func (p *Plugin) ServeHTTP(_ *plugin.Context, w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusForbidden, guestDeniedMessage)
 			return
 		}
-		if p.mcpServer == nil {
+		server := p.getMCPServer()
+		if server == nil {
 			http.Error(w, "MCP server is not initialized", http.StatusServiceUnavailable)
 			return
 		}
-		p.mcpServer.ServeHTTP(w, r)
+		server.ServeHTTP(w, r)
 		return
 	}
 	http.NotFound(w, r)
