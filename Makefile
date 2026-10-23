@@ -44,7 +44,12 @@ endif
 # Used for semver bumping
 PROTECTED_BRANCH := master
 APP_NAME    := $(shell basename -s .git `git config --get remote.origin.url`)
-CURRENT_VERSION := $(shell git describe --abbrev=0 --tags)
+# Only semver tags count. With no release yet, start at v0.0.0 so the first
+# minor bump is v0.1.0 rather than an unparsable tag like v.1.0.
+CURRENT_VERSION := $(shell git describe --abbrev=0 --tags --match "v[0-9]*\.[0-9]*\.[0-9]*" 2>/dev/null)
+ifeq ($(strip $(CURRENT_VERSION)),)
+CURRENT_VERSION := v0.0.0
+endif
 VERSION_PARTS := $(subst ., ,$(subst v,,$(subst -rc, ,$(CURRENT_VERSION))))
 MAJOR := $(word 1,$(VERSION_PARTS))
 MINOR := $(word 2,$(VERSION_PARTS))
