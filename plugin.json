@@ -34,6 +34,13 @@
                 "help_text": "Override for testing. Leave empty to use https://api.cursor.com.",
                 "default": "",
                 "placeholder": "https://api.cursor.com"
+            },
+            {
+                "key": "ExposeMCPToolsPublicly",
+                "display_name": "Expose MCP tools through the public Mattermost MCP server",
+                "type": "bool",
+                "help_text": "When enabled, this plugin's MCP tools are exposed through the public Mattermost MCP server (served by the Mattermost Agents plugin). Stays off unless an admin turns it on.",
+                "default": false
             }
         ]
     }
