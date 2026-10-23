@@ -9,6 +9,7 @@ An administrator configures the Service Account API Key in the Mattermost System
 - `create_agent`
 - `get_agent`
 - `list_agents`
+- `list_environments`
 - `add_followup`
 - `get_agent_conversation`
 

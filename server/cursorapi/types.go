@@ -15,19 +15,26 @@ type RepoConfig struct {
 
 type CreateAgentRequest struct {
 	Prompt       Prompt       `json:"prompt"`
+	Env          *AgentEnv    `json:"env,omitempty"`
 	Repos        []RepoConfig `json:"repos,omitempty"`
 	Model        *ModelRef    `json:"model,omitempty"`
 	AutoCreatePR *bool        `json:"autoCreatePR,omitempty"`
 }
 
-func NewCreateAgentRequest(prompt, repository, ref, model string, autoCreatePR *bool) CreateAgentRequest {
+func NewCreateAgentRequest(
+	prompt string,
+	repos []RepoConfig,
+	environment string,
+	model string,
+	autoCreatePR *bool,
+) CreateAgentRequest {
 	request := CreateAgentRequest{
-		Prompt: Prompt{Text: prompt},
-		Repos: []RepoConfig{{
-			URL:         repository,
-			StartingRef: ref,
-		}},
+		Prompt:       Prompt{Text: prompt},
+		Repos:        repos,
 		AutoCreatePR: autoCreatePR,
+	}
+	if environment != "" {
+		request.Env = &AgentEnv{Type: "cloud", Name: environment}
 	}
 	if model != "" {
 		request.Model = &ModelRef{ID: model}
@@ -104,6 +111,20 @@ type CreateRunResponse struct {
 type ListAgentsResponse struct {
 	Items      []AgentSummary `json:"items"`
 	NextCursor string         `json:"nextCursor,omitempty"`
+}
+
+type Environment struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Owner     string       `json:"owner"`
+	Repos     []RepoConfig `json:"repos,omitempty"`
+	CreatedAt string       `json:"createdAt"`
+	UpdatedAt string       `json:"updatedAt"`
+}
+
+type ListEnvironmentsResponse struct {
+	Items      []Environment `json:"items"`
+	NextCursor string        `json:"nextCursor,omitempty"`
 }
 
 type Message struct {

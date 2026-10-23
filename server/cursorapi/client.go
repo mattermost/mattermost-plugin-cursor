@@ -81,6 +81,10 @@ func (c *Client) ListAgents(ctx context.Context, query url.Values) (Response, er
 	return c.do(ctx, http.MethodGet, "/v1/agents", query, nil)
 }
 
+func (c *Client) ListEnvironments(ctx context.Context, query url.Values) (Response, error) {
+	return c.do(ctx, http.MethodGet, "/v1/environments", query, nil)
+}
+
 func (c *Client) CreateAgent(ctx context.Context, request CreateAgentRequest) (Response, error) {
 	return c.do(ctx, http.MethodPost, "/v1/agents", nil, request)
 }
