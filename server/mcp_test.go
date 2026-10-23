@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -138,7 +140,7 @@ func happyPathCursorAPI(t *testing.T) http.Handler {
 				"id":"bc-list","name":"Listed","status":"ACTIVE",
 				"env":{"type":"cloud"},"url":"https://cursor.com/agents/bc-list",
 				"createdAt":"2026-01-02T03:04:05Z","updatedAt":"2026-01-02T03:05:05Z",
-				"repos":[{"url":"https://github.com/acme/repo"}],
+				"repos":[{"url":"https://github.com/acme/repo"},{"url":"https://github.com/acme/web"}],
 				"workOnCurrentBranch":false,"autoCreatePR":false
 			}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/agents/bc-follow/runs":
@@ -167,8 +169,10 @@ func TestMCPToolHandlersHappyPath(t *testing.T) {
 			name: "create_agent",
 			run: func(t *testing.T) {
 				result, output, err := p.mcpCreateAgent(ctx, nil, createAgentInput{
-					Prompt:     "make a change",
-					Repository: "https://github.com/acme/repo",
+					Prompt: "make a change",
+					Repositories: []repositoryInput{{
+						URL: "https://github.com/acme/repo",
+					}},
 				})
 				require.NoError(t, err)
 				assert.Nil(t, result)
@@ -210,7 +214,11 @@ func TestMCPToolHandlersHappyPath(t *testing.T) {
 					Name:       "Listed",
 					Status:     "ACTIVE",
 					Repository: "https://github.com/acme/repo",
-					CreatedAt:  "2026-01-02T03:04:05Z",
+					Repositories: []string{
+						"https://github.com/acme/repo",
+						"https://github.com/acme/web",
+					},
+					CreatedAt: "2026-01-02T03:04:05Z",
 				}, output.Agents[0])
 			},
 		},
@@ -247,6 +255,160 @@ func TestMCPToolHandlersHappyPath(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, test.run)
+	}
+}
+
+func TestMCPCreateAgentSendsEveryRepository(t *testing.T) {
+	var got cursorapi.CreateAgentRequest
+	p := newTestPlugin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/v1/agents", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(body, &got))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{
+			"agent":{"id":"bc-created","name":"Created","status":"ACTIVE","url":"https://cursor.com/agents/bc-created"},
+			"run":{"id":"run-created","status":"CREATING"}
+		}`)
+	}))
+	autoCreatePR := true
+	result, output, err := p.mcpCreateAgent(context.Background(), nil, createAgentInput{
+		Prompt: "update the API and the web app",
+		Repositories: []repositoryInput{
+			{URL: " https://github.com/acme/api ", Ref: " main "},
+			{URL: "https://github.com/acme/web"},
+		},
+		Model:        "composer-2",
+		AutoCreatePR: &autoCreatePR,
+	})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+	assert.Equal(t, "bc-created", output.AgentID)
+	assert.Equal(t, cursorapi.CreateAgentRequest{
+		Prompt: cursorapi.Prompt{Text: "update the API and the web app"},
+		Repos: []cursorapi.RepoConfig{
+			{URL: "https://github.com/acme/api", StartingRef: "main"},
+			{URL: "https://github.com/acme/web"},
+		},
+		Model:        &cursorapi.ModelRef{ID: "composer-2"},
+		AutoCreatePR: &autoCreatePR,
+	}, got)
+}
+
+func TestMCPCreateAgentAcceptsSingleRepository(t *testing.T) {
+	var got cursorapi.CreateAgentRequest
+	p := newTestPlugin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(body, &got))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{
+			"agent":{"id":"bc-created","name":"Created","status":"ACTIVE","url":"https://cursor.com/agents/bc-created"},
+			"run":{"id":"run-created","status":"CREATING"}
+		}`)
+	}))
+	recs := attachAuditCapture(p)
+	result, _, err := p.mcpCreateAgent(context.Background(), nil, createAgentInput{
+		Prompt:     "make a change",
+		Repository: " https://github.com/acme/repo ",
+		Ref:        " main ",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+	assert.Equal(t, []cursorapi.RepoConfig{{
+		URL:         "https://github.com/acme/repo",
+		StartingRef: "main",
+	}}, got.Repos)
+	rec := requireAudit(t, recs, auditEventMCPCreateAgent, "create_agent", model.AuditStatusSuccess)
+	assert.Equal(t, "https://github.com/acme/repo", rec.EventData.Parameters["repository"])
+	assert.Equal(t, "main", rec.EventData.Parameters["ref"])
+	_, hasRepositories := rec.EventData.Parameters["repositories"]
+	assert.False(t, hasRepositories)
+}
+
+func TestMCPCreateAgentRejectsInvalidRepositories(t *testing.T) {
+	p := newTestPlugin(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("upstream should not be called for an invalid repository list")
+	}))
+	recs := attachAuditCapture(p)
+	tooMany := make([]repositoryInput, maxAgentRepositories+1)
+	for i := range tooMany {
+		tooMany[i] = repositoryInput{URL: "https://github.com/acme/repo-" + strconv.Itoa(i)}
+	}
+
+	tests := []struct {
+		name  string
+		input createAgentInput
+		want  string
+	}{
+		{
+			name:  "none",
+			input: createAgentInput{Prompt: "should not launch"},
+			want:  "At least one repository is required",
+		},
+		{
+			name: "blank url",
+			input: createAgentInput{
+				Prompt:       "should not launch",
+				Repositories: []repositoryInput{{URL: "  "}},
+			},
+			want: "Each repository needs a URL",
+		},
+		{
+			name: "duplicate",
+			input: createAgentInput{
+				Prompt: "should not launch",
+				Repositories: []repositoryInput{
+					{URL: "https://github.com/acme/api"},
+					{URL: " https://github.com/acme/api "},
+				},
+			},
+			want: "Repository URLs must be unique",
+		},
+		{
+			name: "too many",
+			input: createAgentInput{
+				Prompt:       "should not launch",
+				Repositories: tooMany,
+			},
+			want: "Cursor Cloud accepts at most 500 repositories",
+		},
+		{
+			name: "both forms",
+			input: createAgentInput{
+				Prompt:       "should not launch",
+				Repository:   "https://github.com/acme/api",
+				Repositories: []repositoryInput{{URL: "https://github.com/acme/web"}},
+			},
+			want: "Pass repository or repositories, not both",
+		},
+		{
+			name: "ref without repository",
+			input: createAgentInput{
+				Prompt: "should not launch",
+				Ref:    "main",
+			},
+			want: "A repository URL is required when ref is set",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			*recs = (*recs)[:0]
+			result, output, err := p.mcpCreateAgent(context.Background(), nil, test.input)
+			require.NoError(t, err)
+			assert.Equal(t, createAgentOutput{}, output)
+			require.NotNil(t, result)
+			assert.True(t, result.IsError)
+			require.Len(t, result.Content, 1)
+			text, ok := result.Content[0].(*mcp.TextContent)
+			require.True(t, ok)
+			assert.Equal(t, test.want, text.Text)
+			rec := requireAudit(t, recs, auditEventMCPCreateAgent, "create_agent", model.AuditStatusFail)
+			assert.Equal(t, test.want, rec.Error.Description)
+		})
 	}
 }
 
@@ -419,18 +581,20 @@ func TestMCPToolAuditLogs(t *testing.T) {
 	t.Run("create_agent", func(t *testing.T) {
 		*recs = (*recs)[:0]
 		result, _, err := p.mcpCreateAgent(ctx, nil, createAgentInput{
-			Prompt:     "make a change with secrets",
-			Repository: "https://github.com/acme/repo",
-			Ref:        "main",
-			Model:      "composer-2",
+			Prompt: "make a change with secrets",
+			Repositories: []repositoryInput{{
+				URL: "https://github.com/acme/repo",
+				Ref: "main",
+			}},
+			Model: "composer-2",
 		})
 		require.NoError(t, err)
 		assert.Nil(t, result)
 		rec := requireAudit(t, recs, auditEventMCPCreateAgent, "create_agent", model.AuditStatusSuccess)
 		assert.Equal(t, testMCPUserID, rec.Actor.UserId)
 		assert.Equal(t, testMCPUserID, rec.EventData.Parameters["user_id"])
-		assert.Equal(t, "https://github.com/acme/repo", rec.EventData.Parameters["repository"])
-		assert.Equal(t, "main", rec.EventData.Parameters["ref"])
+		assert.Equal(t, []string{"https://github.com/acme/repo"}, rec.EventData.Parameters["repositories"])
+		assert.Equal(t, map[string]string{"https://github.com/acme/repo": "main"}, rec.EventData.Parameters["refs"])
 		assert.Equal(t, "composer-2", rec.EventData.Parameters["model"])
 		assert.Equal(t, "bc-created", rec.EventData.Parameters["agent_id"])
 	})
@@ -506,8 +670,10 @@ func TestMCPToolAuditMissingUserID(t *testing.T) {
 			tool:  "create_agent",
 			call: func() *mcp.CallToolResult {
 				result, _, _ := p.mcpCreateAgent(ctx, nil, createAgentInput{
-					Prompt:     "should not launch",
-					Repository: "https://github.com/acme/repo",
+					Prompt: "should not launch",
+					Repositories: []repositoryInput{{
+						URL: "https://github.com/acme/repo",
+					}},
 				})
 				return result
 			},

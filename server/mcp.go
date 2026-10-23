@@ -22,14 +22,21 @@ import (
 const (
 	conversationCharacterBudget = 20_000
 	serviceAccountCachePrefix   = "service-account:"
+	maxAgentRepositories        = 500
 )
 
+type repositoryInput struct {
+	URL string `json:"url" jsonschema:"Repository URL such as https://github.com/org/repo,minLength=1"`
+	Ref string `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA for this repository"`
+}
+
 type createAgentInput struct {
-	Prompt       string `json:"prompt" jsonschema:"Task for the autonomous Cursor Cloud agent,minLength=1"`
-	Repository   string `json:"repository" jsonschema:"GitHub repository URL such as https://github.com/org/repo,minLength=1"`
-	Ref          string `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA"`
-	Model        string `json:"model,omitempty" jsonschema:"Optional Cursor model ID"`
-	AutoCreatePR *bool  `json:"auto_create_pr,omitempty" jsonschema:"Whether Cursor should open a pull request when work completes"`
+	Prompt       string            `json:"prompt" jsonschema:"Task for the autonomous Cursor Cloud agent,minLength=1"`
+	Repository   string            `json:"repository,omitempty" jsonschema:"Single repository URL such as https://github.com/org/repo. Omit when repositories is set."`
+	Ref          string            `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA for repository. Omit when repositories is set."`
+	Repositories []repositoryInput `json:"repositories,omitempty" jsonschema:"Repositories the Cloud agent clones. Pass one entry per repository so one agent can work across several. Each entry can set its own ref. Omit when repository is set. Cursor Cloud accepts at most 500."`
+	Model        string            `json:"model,omitempty" jsonschema:"Optional Cursor model ID"`
+	AutoCreatePR *bool             `json:"auto_create_pr,omitempty" jsonschema:"Whether Cursor should open a pull request when work completes"`
 }
 
 type createAgentOutput struct {
@@ -58,11 +65,12 @@ type listAgentsInput struct {
 }
 
 type listedAgent struct {
-	AgentID    string `json:"agent_id"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Repository string `json:"repository"`
-	CreatedAt  string `json:"created_at"`
+	AgentID      string   `json:"agent_id"`
+	Name         string   `json:"name"`
+	Status       string   `json:"status"`
+	Repository   string   `json:"repository"`
+	Repositories []string `json:"repositories"`
+	CreatedAt    string   `json:"created_at"`
 }
 
 type listAgentsOutput struct {
@@ -107,7 +115,8 @@ func (p *Plugin) initMCPServer() {
 	})
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
 		Name: "create_agent",
-		Description: "Launch an autonomous Cursor Cloud agent on a repository and return immediately. " +
+		Description: "Launch an autonomous Cursor Cloud agent and return immediately. " +
+			"Pass repositories to clone one or more repositories, or repository for a single repository. " +
 			"The agent runs asynchronously; poll it with get_agent.",
 	}, p.mcpCreateAgent)
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
@@ -139,9 +148,18 @@ func (p *Plugin) mcpCreateAgent(
 	if failure != nil {
 		return failure, createAgentOutput{}, nil
 	}
-	model.AddEventParameterToAuditRec(rec, "repository", input.Repository)
-	if input.Ref != "" {
-		model.AddEventParameterToAuditRec(rec, "ref", input.Ref)
+	if repository := strings.TrimSpace(input.Repository); repository != "" {
+		model.AddEventParameterToAuditRec(rec, "repository", repository)
+	}
+	if ref := strings.TrimSpace(input.Ref); ref != "" {
+		model.AddEventParameterToAuditRec(rec, "ref", ref)
+	}
+	if len(input.Repositories) > 0 {
+		repositoryURLs, repositoryRefs := repositoryAuditValues(input.Repositories)
+		model.AddEventParameterToAuditRec(rec, "repositories", repositoryURLs)
+		if len(repositoryRefs) > 0 {
+			model.AddEventParameterToAuditRec(rec, "refs", repositoryRefs)
+		}
 	}
 	if input.Model != "" {
 		model.AddEventParameterToAuditRec(rec, "model", input.Model)
@@ -152,10 +170,18 @@ func (p *Plugin) mcpCreateAgent(
 		rec.AddErrorDesc("service account API key is not configured")
 		return failure, createAgentOutput{}, nil
 	}
+	resolved, validationMessage := resolveRepositoryInputs(input)
+	var repos []cursorapi.RepoConfig
+	if validationMessage == "" {
+		repos, validationMessage = normalizeRepositories(resolved)
+	}
+	if validationMessage != "" {
+		rec.AddErrorDesc(validationMessage)
+		return toolError(validationMessage), createAgentOutput{}, nil
+	}
 	request := cursorapi.NewCreateAgentRequest(
 		input.Prompt,
-		input.Repository,
-		input.Ref,
+		repos,
 		input.Model,
 		input.AutoCreatePR,
 	)
@@ -262,16 +288,14 @@ func (p *Plugin) mcpListAgents(
 	hydrated := p.hydrateAgents(ctx, cacheIdentity, client, list.Items, false)
 	output := listAgentsOutput{Agents: make([]listedAgent, 0, len(hydrated))}
 	for _, agent := range hydrated {
-		repository := ""
-		if len(agent.Repos) > 0 {
-			repository = agent.Repos[0].URL
-		}
+		repository, repositories := listedRepositories(agent.Repos)
 		output.Agents = append(output.Agents, listedAgent{
-			AgentID:    agent.ID,
-			Name:       agent.Name,
-			Status:     agent.Status,
-			Repository: repository,
-			CreatedAt:  agent.CreatedAt,
+			AgentID:      agent.ID,
+			Name:         agent.Name,
+			Status:       agent.Status,
+			Repository:   repository,
+			Repositories: repositories,
+			CreatedAt:    agent.CreatedAt,
 		})
 	}
 	rec.Success()
@@ -341,6 +365,80 @@ func (p *Plugin) mcpGetAgentConversation(
 	output := truncateMessages(conversation.Messages, conversationCharacterBudget)
 	rec.Success()
 	return nil, output, nil
+}
+
+func repositoryAuditValues(inputs []repositoryInput) ([]string, map[string]string) {
+	urls := make([]string, 0, len(inputs))
+	var refs map[string]string
+	for _, input := range inputs {
+		repoURL := strings.TrimSpace(input.URL)
+		urls = append(urls, repoURL)
+		ref := strings.TrimSpace(input.Ref)
+		if ref == "" {
+			continue
+		}
+		if refs == nil {
+			refs = make(map[string]string)
+		}
+		refs[repoURL] = ref
+	}
+	return urls, refs
+}
+
+func resolveRepositoryInputs(input createAgentInput) ([]repositoryInput, string) {
+	repository := strings.TrimSpace(input.Repository)
+	ref := strings.TrimSpace(input.Ref)
+	hasSingular := repository != "" || ref != ""
+	if len(input.Repositories) > 0 && hasSingular {
+		return nil, "Pass repository or repositories, not both"
+	}
+	if len(input.Repositories) > 0 {
+		return input.Repositories, ""
+	}
+	if repository == "" {
+		if ref != "" {
+			return nil, "A repository URL is required when ref is set"
+		}
+		return nil, "At least one repository is required"
+	}
+	return []repositoryInput{{URL: repository, Ref: ref}}, ""
+}
+
+func listedRepositories(repos []cursorapi.RepoConfig) (string, []string) {
+	urls := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		urls = append(urls, repo.URL)
+	}
+	if len(urls) == 0 {
+		return "", []string{}
+	}
+	return urls[0], urls
+}
+
+func normalizeRepositories(inputs []repositoryInput) ([]cursorapi.RepoConfig, string) {
+	if len(inputs) == 0 {
+		return nil, "At least one repository is required"
+	}
+	if len(inputs) > maxAgentRepositories {
+		return nil, fmt.Sprintf("Cursor Cloud accepts at most %d repositories", maxAgentRepositories)
+	}
+	repos := make([]cursorapi.RepoConfig, 0, len(inputs))
+	seen := make(map[string]struct{}, len(inputs))
+	for _, input := range inputs {
+		repoURL := strings.TrimSpace(input.URL)
+		if repoURL == "" {
+			return nil, "Each repository needs a URL"
+		}
+		if _, exists := seen[repoURL]; exists {
+			return nil, "Repository URLs must be unique"
+		}
+		seen[repoURL] = struct{}{}
+		repos = append(repos, cursorapi.RepoConfig{
+			URL:         repoURL,
+			StartingRef: strings.TrimSpace(input.Ref),
+		})
+	}
+	return repos, ""
 }
 
 func (p *Plugin) mcpClient() (*cursorapi.Client, string, *mcp.CallToolResult) {

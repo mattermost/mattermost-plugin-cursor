@@ -66,7 +66,7 @@ func (p *Plugin) finishMCPAudit(rec *model.AuditRecord) {
 		"user_id", userID,
 		"status", rec.Status,
 	}
-	for _, key := range []string{"agent_id", "repository", "ref", "limit", "model"} {
+	for _, key := range []string{"agent_id", "repository", "ref", "repositories", "refs", "limit", "model"} {
 		value, ok := rec.EventData.Parameters[key]
 		if !ok {
 			continue

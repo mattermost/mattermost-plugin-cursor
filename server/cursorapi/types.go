@@ -20,13 +20,10 @@ type CreateAgentRequest struct {
 	AutoCreatePR *bool        `json:"autoCreatePR,omitempty"`
 }
 
-func NewCreateAgentRequest(prompt, repository, ref, model string, autoCreatePR *bool) CreateAgentRequest {
+func NewCreateAgentRequest(prompt string, repos []RepoConfig, model string, autoCreatePR *bool) CreateAgentRequest {
 	request := CreateAgentRequest{
-		Prompt: Prompt{Text: prompt},
-		Repos: []RepoConfig{{
-			URL:         repository,
-			StartingRef: ref,
-		}},
+		Prompt:       Prompt{Text: prompt},
+		Repos:        repos,
 		AutoCreatePR: autoCreatePR,
 	}
 	if model != "" {
