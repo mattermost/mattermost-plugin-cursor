@@ -268,6 +268,16 @@ func TestConfigurationValidateRejectsMalformedParams(t *testing.T) {
 			want:   "expected a JSON array",
 		},
 		{
+			name:   "trailing data after array",
+			config: configuration{DefaultModelID: "composer-2", DefaultModelParams: `[{"id":"fast","value":"true"}] garbage`},
+			want:   "expected a single JSON array",
+		},
+		{
+			name:   "second array after first",
+			config: configuration{DefaultModelID: "composer-2", DefaultModelParams: `[{"id":"fast","value":"true"}][{"id":"x","value":"y"}]`},
+			want:   "expected a single JSON array",
+		},
+		{
 			name:   "empty id",
 			config: configuration{DefaultModelID: "composer-2", DefaultModelParams: `[{"id":"","value":"true"}]`},
 			want:   "needs a non-empty id and value",

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -89,6 +90,9 @@ func parseDefaultModelParams(raw string) ([]cursorapi.ModelParam, error) {
 		return nil, fmt.Errorf(
 			"invalid Default Model Parameters, expected a JSON array like "+
 				`[{"id":"thinking","value":"high"}]: %w`, err)
+	}
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid Default Model Parameters, expected a single JSON array")
 	}
 	seen := make(map[string]struct{}, len(params))
 	for i := range params {
