@@ -107,21 +107,6 @@ func (c *hydrationCache) putRun(userID string, agent cursorapi.AgentSummary, run
 	}
 }
 
-func (c *hydrationCache) invalidateUser(userID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key := range c.agents {
-		if key.userID == userID {
-			delete(c.agents, key)
-		}
-	}
-	for key := range c.runs {
-		if key.userID == userID {
-			delete(c.runs, key)
-		}
-	}
-}
-
 func evictLeastRecentlyUsed[K comparable, T any](entries map[K]T, access func(T) uint64) {
 	var oldestKey K
 	var oldestAccess uint64
