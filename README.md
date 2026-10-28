@@ -36,7 +36,7 @@ Edge cases:
 - **Service Account API Key** — powers every MCP tool call.
 - **Cursor API Base URL** — override for testing; defaults to `https://api.cursor.com`.
 - **Default Model ID** — optional Cursor model ID used when the Agents bot does not request one. Leave empty to defer to Cursor's own defaults.
-- **Default Model Parameters** — optional JSON array of `{ "id", "value" }` applied with the Default Model ID, for example `[{"id":"thinking","value":"high"}]`. Requires a Default Model ID. Invalid JSON (or params without a Default Model ID) is rejected on save with a helpful message.
+- **Default Model Parameters** — optional JSON array of `{ "id", "value" }` applied with the Default Model ID, for example `[{"id":"thinking","value":"high"}]`. Requires a Default Model ID. Invalid JSON (or params without a Default Model ID) is ignored with a warning logged by the plugin, and every other setting still applies.
 
 ## Build and develop
 

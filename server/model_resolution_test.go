@@ -295,9 +295,37 @@ func TestConfigurationValidateRejectsMalformedParams(t *testing.T) {
 func TestConfigurationValidateAcceptsValidParams(t *testing.T) {
 	config := configuration{
 		DefaultModelID:     "  composer-2  ",
-		DefaultModelParams: `[{"id":"fast","value":"true"}]`,
+		DefaultModelParams: `[{"id":" fast ","value":" true "}]`,
 	}
 	require.NoError(t, config.validate())
 	assert.Equal(t, "composer-2", config.DefaultModelID)
+	assert.Equal(t, []cursorapi.ModelParam{{ID: "fast", Value: "true"}}, config.defaultModelParams)
+}
+
+func TestConfigurationSanitizeDropsInvalidParamsButKeepsOtherSettings(t *testing.T) {
+	config := configuration{
+		CursorAPIBaseURL:     "https://example.test",
+		ServiceAccountAPIKey: "rotated-key",
+		DefaultModelID:       "  composer-2  ",
+		DefaultModelParams:   "not json",
+	}
+	err := config.sanitize()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected a JSON array")
+
+	// Other settings survive, and the invalid params are dropped.
+	assert.Equal(t, "https://example.test", config.CursorAPIBaseURL)
+	assert.Equal(t, "rotated-key", config.ServiceAccountAPIKey)
+	assert.Equal(t, "composer-2", config.DefaultModelID)
+	assert.Empty(t, config.DefaultModelParams)
+	assert.Nil(t, config.defaultModelParams)
+}
+
+func TestConfigurationSanitizeKeepsValidParams(t *testing.T) {
+	config := configuration{
+		DefaultModelID:     "composer-2",
+		DefaultModelParams: `[{"id":"fast","value":"true"}]`,
+	}
+	require.NoError(t, config.sanitize())
 	assert.Equal(t, []cursorapi.ModelParam{{ID: "fast", Value: "true"}}, config.defaultModelParams)
 }

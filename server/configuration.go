@@ -29,16 +29,36 @@ func (p *Plugin) OnConfigurationChange() error {
 	if err := p.API.LoadPluginConfiguration(&next); err != nil {
 		return err
 	}
-	if err := next.validate(); err != nil {
-		p.logWarn("Rejected invalid Cursor plugin configuration", "error", err.Error())
-		return err
+	// A returned error here is only logged by Mattermost; it does not reject the
+	// System Console save or roll it back. Returning it would silently discard
+	// the rest of the configuration (including a rotated API key) and fail
+	// activation on the next restart. Instead, drop only the invalid defaults so
+	// every other setting still applies, and log a warning for the admin.
+	if err := next.sanitize(); err != nil {
+		p.logWarn(
+			"Ignoring invalid Cursor default model parameters; other settings still apply",
+			"error", err.Error(),
+		)
 	}
 	p.setConfiguration(&next)
 	return nil
 }
 
-// validate parses and checks admin-provided defaults, failing with a helpful
-// message when the input is malformed so the System Console surfaces it on save.
+// sanitize normalizes and validates admin defaults. When the default model
+// parameters are invalid it clears them so the rest of the configuration still
+// applies, and returns the validation error for logging.
+func (c *configuration) sanitize() error {
+	if err := c.validate(); err != nil {
+		c.DefaultModelParams = ""
+		c.defaultModelParams = nil
+		_ = c.validate()
+		return err
+	}
+	return nil
+}
+
+// validate parses and normalizes admin-provided defaults, returning a helpful
+// message when the input is malformed.
 func (c *configuration) validate() error {
 	c.DefaultModelID = strings.TrimSpace(c.DefaultModelID)
 	params, err := parseDefaultModelParams(c.DefaultModelParams)
@@ -71,15 +91,17 @@ func parseDefaultModelParams(raw string) ([]cursorapi.ModelParam, error) {
 				`[{"id":"thinking","value":"high"}]: %w`, err)
 	}
 	seen := make(map[string]struct{}, len(params))
-	for _, param := range params {
-		id := strings.TrimSpace(param.ID)
-		if id == "" || strings.TrimSpace(param.Value) == "" {
+	for i := range params {
+		id := strings.TrimSpace(params[i].ID)
+		value := strings.TrimSpace(params[i].Value)
+		if id == "" || value == "" {
 			return nil, errors.New("each Default Model Parameter needs a non-empty id and value")
 		}
 		if _, dup := seen[id]; dup {
 			return nil, fmt.Errorf("duplicate Default Model Parameter id %q", id)
 		}
 		seen[id] = struct{}{}
+		params[i] = cursorapi.ModelParam{ID: id, Value: value}
 	}
 	return params, nil
 }
