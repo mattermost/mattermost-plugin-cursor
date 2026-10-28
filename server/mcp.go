@@ -30,13 +30,19 @@ type repositoryInput struct {
 	Ref string `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA for this repository"`
 }
 
+type modelParamInput struct {
+	ID    string `json:"id" jsonschema:"Parameter ID from list_models (for example thinking or fast),minLength=1"`
+	Value string `json:"value" jsonschema:"Permitted value for the parameter from list_models (for example high or true),minLength=1"`
+}
+
 type createAgentInput struct {
 	Prompt       string            `json:"prompt" jsonschema:"Task for the autonomous Cursor Cloud agent,minLength=1"`
 	Repository   string            `json:"repository,omitempty" jsonschema:"Single repository URL such as https://github.com/org/repo. Omit when repositories is set."`
 	Ref          string            `json:"ref,omitempty" jsonschema:"Optional starting branch or commit SHA for repository. Omit when repositories is set."`
 	Repositories []repositoryInput `json:"repositories,omitempty" jsonschema:"Repositories the Cloud agent clones. Pass one entry per repository so one agent can work across several. Each entry can set its own ref. Omit when repository or environment is set. Cursor Cloud accepts at most 500."`
 	Environment  string            `json:"environment,omitempty" jsonschema:"Saved Cloud environment name. Cursor runs the agent in that environment, so omit repository and repositories."`
-	Model        string            `json:"model,omitempty" jsonschema:"Optional Cursor model ID"`
+	Model        string            `json:"model,omitempty" jsonschema:"Optional Cursor model ID such as claude-4.6-sonnet-thinking. Omit to use the admin default or Cursor's own default. Call list_models to discover valid IDs before choosing one."`
+	ModelParams  []modelParamInput `json:"model_params,omitempty" jsonschema:"Optional per-model parameters such as reasoning effort or context window. Each item needs an id and a value from list_models for the chosen model. Requires model unless an admin default model is configured."`
 	AutoCreatePR *bool             `json:"auto_create_pr,omitempty" jsonschema:"Whether Cursor should open a pull request when work completes"`
 }
 
@@ -122,6 +128,44 @@ type getAgentConversationOutput struct {
 	Truncated bool                  `json:"truncated,omitempty"`
 }
 
+type listModelsInput struct{}
+
+type modelParamOutput struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+type modelParamValueOutput struct {
+	Value       string `json:"value"`
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+type modelParameterOutput struct {
+	ID          string                  `json:"id"`
+	DisplayName string                  `json:"display_name,omitempty"`
+	Values      []modelParamValueOutput `json:"values"`
+}
+
+type modelVariantOutput struct {
+	Params      []modelParamOutput `json:"params"`
+	DisplayName string             `json:"display_name,omitempty"`
+	Description string             `json:"description,omitempty"`
+	IsDefault   bool               `json:"is_default,omitempty"`
+}
+
+type listedModel struct {
+	ID          string                 `json:"id"`
+	DisplayName string                 `json:"display_name,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Aliases     []string               `json:"aliases,omitempty"`
+	Parameters  []modelParameterOutput `json:"parameters"`
+	Variants    []modelVariantOutput   `json:"variants"`
+}
+
+type listModelsOutput struct {
+	Models []listedModel `json:"models"`
+}
+
 func (p *Plugin) initMCPServer() {
 	version := "0.0.1"
 	if manifest != nil && manifest.Version != "" {
@@ -139,8 +183,17 @@ func (p *Plugin) initMCPServer() {
 		Description: "Launch an autonomous Cursor Cloud agent and return immediately. " +
 			"Pass repositories to clone one or more repositories, repository for a single repository, " +
 			"or environment to use a saved Cloud environment by name. " +
+			"Leave model empty to use the admin default or Cursor's own default. " +
+			"To run on a specific model or variant, call list_models first to discover valid " +
+			"model IDs, parameters, and allowed values, then pass model and optionally model_params. " +
 			"The agent runs asynchronously; poll it with get_agent.",
 	}, p.mcpCreateAgent)
+	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
+		Name: "list_models",
+		Description: "List the Cursor models available to the configured service account, " +
+			"with each model's ID, tunable parameters and their allowed values, and the " +
+			"concrete variants it accepts. Use this to pick a valid model and model_params for create_agent.",
+	}, p.mcpListModels)
 	pluginmcp.AddTool(p.mcpServer, &mcp.Tool{
 		Name:        "get_agent",
 		Description: "Get the current state and latest result of a Cursor Cloud agent.",
@@ -192,8 +245,11 @@ func (p *Plugin) mcpCreateAgent(
 	if environment != "" {
 		model.AddEventParameterToAuditRec(rec, "environment", environment)
 	}
-	if input.Model != "" {
-		model.AddEventParameterToAuditRec(rec, "model", input.Model)
+	if modelID := strings.TrimSpace(input.Model); modelID != "" {
+		model.AddEventParameterToAuditRec(rec, "model", modelID)
+	}
+	if len(input.ModelParams) > 0 {
+		model.AddEventParameterToAuditRec(rec, "model_params", modelParamAuditValues(input.ModelParams))
 	}
 
 	client, _, failure := p.mcpClient()
@@ -210,11 +266,16 @@ func (p *Plugin) mcpCreateAgent(
 		rec.AddErrorDesc(validationMessage)
 		return toolError(validationMessage), createAgentOutput{}, nil
 	}
+	modelRef, validationMessage := resolveModel(input, p.getConfiguration())
+	if validationMessage != "" {
+		rec.AddErrorDesc(validationMessage)
+		return toolError(validationMessage), createAgentOutput{}, nil
+	}
 	request := cursorapi.NewCreateAgentRequest(
 		input.Prompt,
 		repos,
 		environment,
-		input.Model,
+		modelRef,
 		input.AutoCreatePR,
 	)
 	response, err := client.CreateAgent(ctx, request)
@@ -460,6 +521,76 @@ func (p *Plugin) mcpGetAgentConversation(
 	return nil, output, nil
 }
 
+func (p *Plugin) mcpListModels(
+	ctx context.Context,
+	_ *mcp.CallToolRequest,
+	_ listModelsInput,
+) (*mcp.CallToolResult, listModelsOutput, error) {
+	rec, failure := p.beginMCPAudit(ctx, auditEventMCPListModels, "list_models")
+	defer p.finishMCPAudit(rec)
+	if failure != nil {
+		return failure, listModelsOutput{}, nil
+	}
+
+	client, _, failure := p.mcpClient()
+	if failure != nil {
+		rec.AddErrorDesc("service account API key is not configured")
+		return failure, listModelsOutput{}, nil
+	}
+	response, err := client.ListModels(ctx)
+	if err != nil {
+		rec.AddErrorDesc(err.Error())
+		return toolError(err.Error()), listModelsOutput{}, nil
+	}
+	list, err := cursorapi.Decode[cursorapi.ListModelsResponse](response)
+	if err != nil {
+		rec.AddErrorDesc(err.Error())
+		return cursorToolError(response, err), listModelsOutput{}, nil
+	}
+	output := listModelsOutput{Models: make([]listedModel, 0, len(list.Items))}
+	for _, model := range list.Items {
+		output.Models = append(output.Models, toListedModel(model))
+	}
+	rec.Success()
+	return nil, output, nil
+}
+
+func toListedModel(m cursorapi.Model) listedModel {
+	parameters := make([]modelParameterOutput, 0, len(m.Parameters))
+	for _, parameter := range m.Parameters {
+		values := make([]modelParamValueOutput, 0, len(parameter.Values))
+		for _, value := range parameter.Values {
+			values = append(values, modelParamValueOutput{Value: value.Value, DisplayName: value.DisplayName})
+		}
+		parameters = append(parameters, modelParameterOutput{
+			ID:          parameter.ID,
+			DisplayName: parameter.DisplayName,
+			Values:      values,
+		})
+	}
+	variants := make([]modelVariantOutput, 0, len(m.Variants))
+	for _, variant := range m.Variants {
+		params := make([]modelParamOutput, 0, len(variant.Params))
+		for _, param := range variant.Params {
+			params = append(params, modelParamOutput{ID: param.ID, Value: param.Value})
+		}
+		variants = append(variants, modelVariantOutput{
+			Params:      params,
+			DisplayName: variant.DisplayName,
+			Description: variant.Description,
+			IsDefault:   variant.IsDefault,
+		})
+	}
+	return listedModel{
+		ID:          m.ID,
+		DisplayName: m.DisplayName,
+		Description: m.Description,
+		Aliases:     m.Aliases,
+		Parameters:  parameters,
+		Variants:    variants,
+	}
+}
+
 func repositoryAuditValues(inputs []repositoryInput) ([]string, map[string]string) {
 	urls := make([]string, 0, len(inputs))
 	var refs map[string]string
@@ -476,6 +607,87 @@ func repositoryAuditValues(inputs []repositoryInput) ([]string, map[string]strin
 		refs[repoURL] = ref
 	}
 	return urls, refs
+}
+
+func modelParamAuditValues(inputs []modelParamInput) map[string]string {
+	params := make(map[string]string, len(inputs))
+	for _, input := range inputs {
+		params[strings.TrimSpace(input.ID)] = strings.TrimSpace(input.Value)
+	}
+	return params
+}
+
+// resolveModel applies the model precedence rules and returns the model object
+// to send to Cursor (nil to omit model entirely), or a validation message.
+//
+// Precedence:
+//  1. Model/params explicitly provided by the calling agent.
+//  2. The admin-configured default model (and its params).
+//  3. Nothing: omit model so Cursor applies the user, team, then system default.
+//
+// Edge cases:
+//   - Agent provides a model ID but no params: admin default params are applied
+//     only when the agent's model ID equals the admin default model ID, so params
+//     are never paired with a model they may not be valid for.
+//   - Agent provides params but no model ID: the model ID resolves to the admin
+//     default when configured; otherwise this is an error.
+func resolveModel(input createAgentInput, config *configuration) (*cursorapi.ModelRef, string) {
+	agentModelID := strings.TrimSpace(input.Model)
+	agentParams, message := normalizeModelParams(input.ModelParams)
+	if message != "" {
+		return nil, message
+	}
+	adminModelID := strings.TrimSpace(config.DefaultModelID)
+	adminParams := config.defaultModelParams
+
+	if agentModelID != "" {
+		ref := &cursorapi.ModelRef{ID: agentModelID}
+		switch {
+		case len(agentParams) > 0:
+			ref.Params = agentParams
+		case agentModelID == adminModelID && len(adminParams) > 0:
+			ref.Params = adminParams
+		}
+		return ref, ""
+	}
+
+	if len(agentParams) > 0 {
+		if adminModelID == "" {
+			return nil, "model_params require a model. Pass model, or ask an administrator " +
+				"to configure a default model in the System Console."
+		}
+		return &cursorapi.ModelRef{ID: adminModelID, Params: agentParams}, ""
+	}
+
+	if adminModelID != "" {
+		ref := &cursorapi.ModelRef{ID: adminModelID}
+		if len(adminParams) > 0 {
+			ref.Params = adminParams
+		}
+		return ref, ""
+	}
+	return nil, ""
+}
+
+func normalizeModelParams(inputs []modelParamInput) ([]cursorapi.ModelParam, string) {
+	if len(inputs) == 0 {
+		return nil, ""
+	}
+	params := make([]cursorapi.ModelParam, 0, len(inputs))
+	seen := make(map[string]struct{}, len(inputs))
+	for _, input := range inputs {
+		id := strings.TrimSpace(input.ID)
+		value := strings.TrimSpace(input.Value)
+		if id == "" || value == "" {
+			return nil, "Each model parameter needs an id and a value"
+		}
+		if _, exists := seen[id]; exists {
+			return nil, "Model parameter IDs must be unique"
+		}
+		seen[id] = struct{}{}
+		params = append(params, cursorapi.ModelParam{ID: id, Value: value})
+	}
+	return params, ""
 }
 
 func resolveRepositoryInputs(input createAgentInput) ([]repositoryInput, string) {

@@ -34,6 +34,22 @@
                 "help_text": "Override for testing. Leave empty to use https://api.cursor.com.",
                 "default": "",
                 "placeholder": "https://api.cursor.com"
+            },
+            {
+                "key": "DefaultModelID",
+                "display_name": "Default Model ID",
+                "type": "text",
+                "help_text": "Optional. Cursor model ID used when the Agents bot does not request a specific model (for example, claude-4.6-sonnet-thinking). Leave empty to let Cursor pick the user, team, then system default. Find valid IDs with the list_models tool or the Cursor Dashboard.",
+                "default": "",
+                "placeholder": "claude-4.6-sonnet-thinking"
+            },
+            {
+                "key": "DefaultModelParams",
+                "display_name": "Default Model Parameters",
+                "type": "longtext",
+                "help_text": "Optional JSON array of model parameters applied with the Default Model ID, such as [{\"id\":\"thinking\",\"value\":\"high\"}]. Requires a Default Model ID. These apply only when the resolved model matches the Default Model ID. Use list_models to discover valid ids and values.",
+                "default": "",
+                "placeholder": "[{\"id\":\"thinking\",\"value\":\"high\"}]"
             }
         ]
     }
