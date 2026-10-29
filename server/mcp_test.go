@@ -156,6 +156,23 @@ func happyPathCursorAPI(t *testing.T) http.Handler {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/agents/bc-follow/runs":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{"run":{"id":"run-follow","status":"CREATING"}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			_, _ = io.WriteString(w, `{"items":[
+				{
+					"id":"composer-2","displayName":"Composer 2","aliases":["composer-latest"],
+					"parameters":[{"id":"fast","displayName":"Fast","values":[
+						{"value":"false"},{"value":"true","displayName":"Fast"}
+					]}],
+					"variants":[
+						{"params":[{"id":"fast","value":"true"}],"displayName":"Composer 2","isDefault":true},
+						{"params":[{"id":"fast","value":"false"}],"displayName":"Composer 2"}
+					]
+				},
+				{
+					"id":"claude-4.6-sonnet-thinking","displayName":"Claude 4.6 Sonnet (Thinking)",
+					"variants":[{"params":[],"displayName":"Claude 4.6 Sonnet (Thinking)","isDefault":true}]
+				}
+			]}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/agents/bc-conversation/conversation":
 			_, _ = io.WriteString(w, `{"id":"bc-conversation","messages":[
 				{"type":"user_message","text":"Please fix it"},
@@ -281,6 +298,41 @@ func TestMCPToolHandlersHappyPath(t *testing.T) {
 						{Type: "assistant_message", Text: "Done"},
 					},
 				}, output)
+			},
+		},
+		{
+			name: "list_models",
+			run: func(t *testing.T) {
+				result, output, err := p.mcpListModels(ctx, nil, listModelsInput{})
+				require.NoError(t, err)
+				assert.Nil(t, result)
+				assert.Equal(t, listModelsOutput{Models: []listedModel{
+					{
+						ID:          "composer-2",
+						DisplayName: "Composer 2",
+						Aliases:     []string{"composer-latest"},
+						Parameters: []modelParameterOutput{{
+							ID:          "fast",
+							DisplayName: "Fast",
+							Values: []modelParamValueOutput{
+								{Value: "false"},
+								{Value: "true", DisplayName: "Fast"},
+							},
+						}},
+						Variants: []modelVariantOutput{
+							{Params: []modelParamOutput{{ID: "fast", Value: "true"}}, DisplayName: "Composer 2", IsDefault: true},
+							{Params: []modelParamOutput{{ID: "fast", Value: "false"}}, DisplayName: "Composer 2"},
+						},
+					},
+					{
+						ID:          "claude-4.6-sonnet-thinking",
+						DisplayName: "Claude 4.6 Sonnet (Thinking)",
+						Parameters:  []modelParameterOutput{},
+						Variants: []modelVariantOutput{
+							{Params: []modelParamOutput{}, DisplayName: "Claude 4.6 Sonnet (Thinking)", IsDefault: true},
+						},
+					},
+				}}, output)
 			},
 		},
 	}
@@ -601,6 +653,13 @@ func TestMCPToolHandlersMissingKey(t *testing.T) {
 				return result
 			},
 		},
+		{
+			name: "list_models",
+			call: func() *mcp.CallToolResult {
+				result, _, _ := p.mcpListModels(ctx, nil, listModelsInput{})
+				return result
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -727,7 +786,8 @@ func TestMCPToolAuditLogs(t *testing.T) {
 				URL: "https://github.com/acme/repo",
 				Ref: "main",
 			}},
-			Model: "composer-2",
+			Model:       "composer-2",
+			ModelParams: []modelParamInput{{ID: "fast", Value: "true"}},
 		})
 		require.NoError(t, err)
 		assert.Nil(t, result)
@@ -737,6 +797,7 @@ func TestMCPToolAuditLogs(t *testing.T) {
 		assert.Equal(t, []string{"https://github.com/acme/repo"}, rec.EventData.Parameters["repositories"])
 		assert.Equal(t, map[string]string{"https://github.com/acme/repo": "main"}, rec.EventData.Parameters["refs"])
 		assert.Equal(t, "composer-2", rec.EventData.Parameters["model"])
+		assert.Equal(t, map[string]string{"fast": "true"}, rec.EventData.Parameters["model_params"])
 		assert.Equal(t, "bc-created", rec.EventData.Parameters["agent_id"])
 	})
 
@@ -887,6 +948,15 @@ func TestMCPToolAuditMissingUserID(t *testing.T) {
 					nil,
 					getAgentConversationInput{AgentID: "bc-conversation"},
 				)
+				return result
+			},
+		},
+		{
+			name:  "list_models",
+			event: auditEventMCPListModels,
+			tool:  "list_models",
+			call: func() *mcp.CallToolResult {
+				result, _, _ := p.mcpListModels(ctx, nil, listModelsInput{})
 				return result
 			},
 		},

@@ -11,8 +11,6 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
 	"github.com/mattermost/mattermost/server/public/pluginapi"
-
-	"github.com/mattermost/mattermost-plugin-cursor/server/cursorapi"
 )
 
 const (
@@ -72,10 +70,6 @@ func (p *Plugin) ServeHTTP(_ *plugin.Context, w http.ResponseWriter, r *http.Req
 		return
 	}
 	http.NotFound(w, r)
-}
-
-func (p *Plugin) cursorClient(apiKey string) *cursorapi.Client {
-	return cursorapi.NewClient(p.getConfiguration().CursorAPIBaseURL, apiKey, p.httpClient)
 }
 
 func (p *Plugin) logError(message string, err error) {

@@ -4,8 +4,18 @@ type Prompt struct {
 	Text string `json:"text"`
 }
 
+// ModelParam is a single per-model parameter applied to a run, matching the
+// shape Cursor expects in model.params (see GET /v1/models for valid values).
+type ModelParam struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+// ModelRef is the model object sent on Create An Agent. ID is required whenever
+// a model is provided; Params is optional.
 type ModelRef struct {
-	ID string `json:"id"`
+	ID     string       `json:"id"`
+	Params []ModelParam `json:"params,omitempty"`
 }
 
 type RepoConfig struct {
@@ -25,19 +35,17 @@ func NewCreateAgentRequest(
 	prompt string,
 	repos []RepoConfig,
 	environment string,
-	model string,
+	model *ModelRef,
 	autoCreatePR *bool,
 ) CreateAgentRequest {
 	request := CreateAgentRequest{
 		Prompt:       Prompt{Text: prompt},
 		Repos:        repos,
+		Model:        model,
 		AutoCreatePR: autoCreatePR,
 	}
 	if environment != "" {
 		request.Env = &AgentEnv{Type: "cloud", Name: environment}
-	}
-	if model != "" {
-		request.Model = &ModelRef{ID: model}
 	}
 	return request
 }
@@ -150,4 +158,40 @@ type HydratedAgent struct {
 type HydratedListAgentsResponse struct {
 	Items      []HydratedAgent `json:"items"`
 	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+// ModelParamValue is one permitted value for a model parameter.
+type ModelParamValue struct {
+	Value       string `json:"value"`
+	DisplayName string `json:"displayName,omitempty"`
+}
+
+// ModelParameter describes one tunable parameter for a model and its permitted
+// values, as returned by GET /v1/models.
+type ModelParameter struct {
+	ID          string            `json:"id"`
+	DisplayName string            `json:"displayName,omitempty"`
+	Values      []ModelParamValue `json:"values,omitempty"`
+}
+
+// ModelVariant is a concrete id+params combination a model accepts.
+type ModelVariant struct {
+	Params      []ModelParam `json:"params,omitempty"`
+	DisplayName string       `json:"displayName,omitempty"`
+	Description string       `json:"description,omitempty"`
+	IsDefault   bool         `json:"isDefault,omitempty"`
+}
+
+// Model describes a single recommended model from GET /v1/models.
+type Model struct {
+	ID          string           `json:"id"`
+	DisplayName string           `json:"displayName,omitempty"`
+	Description string           `json:"description,omitempty"`
+	Aliases     []string         `json:"aliases,omitempty"`
+	Parameters  []ModelParameter `json:"parameters,omitempty"`
+	Variants    []ModelVariant   `json:"variants,omitempty"`
+}
+
+type ListModelsResponse struct {
+	Items []Model `json:"items"`
 }
